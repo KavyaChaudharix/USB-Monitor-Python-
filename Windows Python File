@@ -1,0 +1,171 @@
+import os
+import time
+import psutil
+import hashlib
+import requests
+import win32api
+import win32con
+
+# List of known malicious file hashes (replace with real hashes)
+MALICIOUS_HASHES = {
+    'd41d8cd98f00b204e9800998ecf8427e',  # Example hash (MD5)
+    # Add more hashes here
+}
+
+# List of known malicious file names and extensions
+MALICIOUS_FILE_NAMES = {'badfile.exe', 'malware.bat'}
+MALICIOUS_EXTENSIONS = {'.exe', '.bat', '.cmd', '.vbs', '.js'}
+
+# VirusTotal API setup (optional)
+API_KEY = input("Enter VirusTotal API key (or press Enter to skip): ").strip()
+USE_VIRUSTOTAL = bool(API_KEY)
+VT_URL = "https://www.virustotal.com/api/v3/files"
+
+def compute_file_hash(file_path):
+    """Compute MD5 hash of a file."""
+    hash_md5 = hashlib.md5()
+    try:
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+    except Exception as e:
+        print(f"Error computing hash for {file_path}: {e}")
+        return None
+    return hash_md5.hexdigest()
+
+def scan_usb(usb_drive):
+    """Scan USB drive for suspicious files."""
+    print(f"Scanning USB drive: {usb_drive}")
+    suspicious_files = []
+    for root, dirs, files in os.walk(usb_drive):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if any(file.lower().endswith(ext) for ext in MALICIOUS_EXTENSIONS) or file.lower() in MALICIOUS_FILE_NAMES:
+                print(f"Found suspicious file by name or extension: {file_path}")
+                suspicious_files.append(file_path)
+            try:
+                file_hash = compute_file_hash(file_path)
+                if file_hash:
+                    if file_hash in MALICIOUS_HASHES:
+                        print(f"Found suspicious file by hash: {file_path}")
+                        suspicious_files.append(file_path)
+                    elif USE_VIRUSTOTAL and check_virustotal(file_path):
+                        print(f"Found suspicious file by VirusTotal: {file_path}")
+                        suspicious_files.append(file_path)
+            except Exception as e:
+                print(f"Error checking file {file_path}: {e}")
+    return suspicious_files
+
+def check_virustotal(file_path):
+    """Check file against VirusTotal if API key is provided."""
+    if not USE_VIRUSTOTAL:
+        return False
+    
+    file_hash = compute_file_hash(file_path)
+    if not file_hash:
+        return False
+
+    headers = {
+        'x-apikey': API_KEY
+    }
+    try:
+        response = requests.get(f"{VT_URL}/{file_hash}", headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            if data['data']['attributes']['last_analysis_stats']['malicious'] > 0:
+                return True
+        elif response.status_code == 204:
+            print(f"VirusTotal: No report found for {file_path}.")
+        else:
+            print(f"VirusTotal API Error: {response.status_code}")
+    except Exception as e:
+        print(f"Error checking VirusTotal for {file_path}: {e}")
+    return False
+
+def check_registry_for_startup():
+    """Check registry for suspicious startup entries."""
+    print("Checking registry for startup entries...")
+    suspicious_entries = []
+    startup_keys = [
+        r'Software\Microsoft\Windows\CurrentVersion\Run',
+        r'Software\Microsoft\Windows\CurrentVersion\RunOnce'
+    ]
+    try:
+        for key in startup_keys:
+            with win32api.OpenKey(win32con.HKEY_CURRENT_USER, key) as reg_key:
+                for i in range(0, win32api.QueryInfoKey(reg_key)[1]):
+                    value_name, value_data, _ = win32api.EnumValue(reg_key, i)
+                    if any(ext in value_data.lower() for ext in MALICIOUS_EXTENSIONS):
+                        print(f"Found suspicious registry entry: Name={value_name}, Data={value_data}")
+                        suspicious_entries.append((value_name, value_data))
+    except Exception as e:
+        print(f"Error accessing registry: {e}")
+    return suspicious_entries
+
+def check_suspicious_processes():
+    """Check for suspicious processes."""
+    print("Checking for suspicious processes...")
+    suspicious_processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'exe', 'memory_info']):
+        try:
+            if proc.info['exe'] and any(proc.info['exe'].lower().endswith(ext) for ext in MALICIOUS_EXTENSIONS):
+                mem_info = proc.info['memory_info']
+                print(f"Found suspicious process: PID={proc.info['pid']}, Name={proc.info['name']}, Path={proc.info['exe']}, Memory Usage={mem_info.rss / (1024 ** 2):.2f} MB")
+                suspicious_processes.append({
+                    'pid': proc.info['pid'],
+                    'name': proc.info['name'],
+                    'path': proc.info['exe'],
+                    'memory': mem_info.rss / (1024 ** 2)  # Memory in MB
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+            print(f"Error accessing process information: {e}")
+    return suspicious_processes
+
+def monitor_usb():
+    """Monitor for new USB devices and scan them."""
+    print("Monitoring USB devices. Press Ctrl+C to exit.")
+    previous_devices = set(win32api.GetLogicalDriveStrings().split('\000')[:-1])
+    
+    while True:
+        time.sleep(5)  # Delay between checks
+        current_devices = set(win32api.GetLogicalDriveStrings().split('\000')[:-1])
+        new_devices = current_devices - previous_devices
+        
+        if new_devices:
+            print(f"New USB Devices Detected: {new_devices}")
+            for device in new_devices:
+                print(f"\nScanning USB Device: {device}")
+                suspicious_files = scan_usb(device)
+                suspicious_processes = check_suspicious_processes()
+                suspicious_startup_entries = check_registry_for_startup()
+
+                # Print concise results
+                print(f"\n--- Scan Summary for USB Device: {device} ---")
+                if suspicious_files:
+                    print("Suspicious Files Detected:")
+                    for file in suspicious_files:
+                        print(f"  - {file}")
+                else:
+                    print("No suspicious files detected.")
+
+                if suspicious_processes:
+                    print("Suspicious Processes Detected:")
+                    for proc in suspicious_processes:
+                        print(f"  - PID: {proc['pid']}, Name: {proc['name']}, Path: {proc['path']}, Memory Usage: {proc['memory']:.2f} MB")
+                else:
+                    print("No suspicious processes detected.")
+                
+                if suspicious_startup_entries:
+                    print("Suspicious Registry Startup Entries Detected:")
+                    for entry in suspicious_startup_entries:
+                        print(f"  - Name: {entry[0]}, Data: {entry[1]}")
+                else:
+                    print("No suspicious registry startup entries detected.")
+        
+        previous_devices = current_devices
+
+if __name__ == "__main__":
+    try:
+        monitor_usb()
+    except KeyboardInterrupt:
+        print("Exiting USB monitor.")
